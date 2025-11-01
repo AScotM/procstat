@@ -14,7 +14,7 @@ class ProcStat {
         }
         $this->uptime = $this->getUptime();
         $this->hertz = $this->detectHertz();
-        $this->limit = $this->getArg('--limit', 20);
+        $this->limit = max(1, (int)$this->getArg('--limit', 20));
         $this->sort  = $this->getArg('--sort', 'cpu');
     }
 
@@ -24,12 +24,12 @@ class ProcStat {
     }
 
     private function getUptime(): float {
-        $c = @file_get_contents('/proc/uptime');
+        $c = file_get_contents('/proc/uptime');
         return $c ? (float)explode(' ', trim($c))[0] : 0.1;
     }
 
     private function detectHertz(): float {
-        $hz = (int)@shell_exec('getconf CLK_TCK 2>/dev/null');
+        $hz = (int)shell_exec('getconf CLK_TCK 2>/dev/null');
         return $hz > 0 ? $hz : 100;
     }
 
@@ -100,7 +100,9 @@ class ProcStat {
             'pid' => 'PID',
             default => 'CPU%',
         };
+        
         usort($data, fn($x, $y) => $y[$key] <=> $x[$key]);
+        
         printf("%5s %6s %9s %s\n", 'PID', 'CPU%', 'MEM(MB)', 'CMD');
         foreach (array_slice($data, 0, $this->limit) as $p) {
             printf("%5d %6.1f %9.1f %s\n", $p['PID'], $p['CPU%'], $p['MEM(MB)'], $p['CMD']);
