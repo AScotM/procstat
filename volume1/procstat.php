@@ -45,9 +45,14 @@ class ProcStat {
     }
 
     private function readProcess(int $pid): ?array {
-        $s = @file_get_contents("/proc/$pid/stat");
+        if (!is_readable("/proc/$pid/stat")) {
+            return null;
+        }
+        
+        $s = file_get_contents("/proc/$pid/stat");
         if (!$s) return null;
-        $a = explode(' ', trim($s));
+        
+        $a = explode(' ', $s);
         if (count($a) < 22) return null;
 
         [$utime, $stime, $cutime, $cstime, $starttime] = [
@@ -58,17 +63,27 @@ class ProcStat {
         $cpu = $seconds > 0 ? round(100 * (($total / $this->hertz) / $seconds), 1) : 0;
 
         $rss = 0;
-        foreach (@file("/proc/$pid/status") ?: [] as $line) {
-            if (str_starts_with($line, 'VmRSS:')) {
-                $rss = (int)filter_var($line, FILTER_SANITIZE_NUMBER_INT);
-                break;
+        $statusFile = "/proc/$pid/status";
+        if (is_readable($statusFile)) {
+            foreach (file($statusFile) as $line) {
+                if (str_starts_with($line, 'VmRSS:')) {
+                    $rss = (int)filter_var($line, FILTER_SANITIZE_NUMBER_INT);
+                    break;
+                }
             }
         }
 
         $cmd = '';
-        $cmdline = @file_get_contents("/proc/$pid/cmdline");
-        if ($cmdline) $cmd = trim(str_replace("\0", ' ', $cmdline));
-        if ($cmd === '') $cmd = '[' . trim($a[1], '()') . ']';
+        $cmdlineFile = "/proc/$pid/cmdline";
+        if (is_readable($cmdlineFile)) {
+            $cmdline = file_get_contents($cmdlineFile);
+            $cmd = trim(str_replace("\0", ' ', $cmdline));
+        }
+        
+        if ($cmd === '') {
+            $cmd = '[' . trim($a[1], '()') . ']';
+        }
+        
         $cmd = mb_strimwidth($cmd, 0, 80, '…', 'UTF-8');
 
         return [
@@ -87,7 +102,7 @@ class ProcStat {
         };
         usort($data, fn($x, $y) => $y[$key] <=> $x[$key]);
         printf("%5s %6s %9s %s\n", 'PID', 'CPU%', 'MEM(MB)', 'CMD');
-        foreach (array_slice($data, 0, (int)$this->limit) as $p) {
+        foreach (array_slice($data, 0, $this->limit) as $p) {
             printf("%5d %6.1f %9.1f %s\n", $p['PID'], $p['CPU%'], $p['MEM(MB)'], $p['CMD']);
         }
     }
