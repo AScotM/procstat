@@ -19,7 +19,7 @@ class ProcStat
     private const VALID_SORTS = ['cpu', 'mem', 'pid', 'command', 'time'];
     private const FLOAT_EPSILON = 0.00001;
     private const MAX_STATS_AGE = 5;
-    private const MAX_THREADS_PER_PROCESS = 100;
+    private const MAX_THREADS_PER_PROCESS = 1000;
     private const BATCH_SIZE = 100;
     private const BATCH_DELAY_US = 1000;
     private const MAX_STATS_SIZE = 1000000;
@@ -42,12 +42,14 @@ class ProcStat
     private float $lastScanTime = 0.0;
     private bool $json;
     private bool $shutdownRequested = false;
+    private bool $signalHandled = false;
     private array $previousStats = [];
     private array $memoryCache = [];
     private int $memoryCacheHits = 0;
     private int $memoryCacheMisses = 0;
     private int $cpuCores = 1;
     private bool $hasBaseline = false;
+    private bool $debug = false;
 
     public function __construct()
     {
@@ -79,6 +81,7 @@ class ProcStat
             'kb',
             'mb',
             'json',
+            'debug'
         ];
 
         $options = getopt($shortOpts, $longOpts);
@@ -91,6 +94,7 @@ class ProcStat
         $this->limit = (int)($options['limit'] ?? self::DEFAULT_LIMIT);
         $this->sort = $options['sort'] ?? 'cpu';
         $this->verbose = isset($options['verbose']);
+        $this->debug = isset($options['debug']);
         $this->zombie = isset($options['zombie']);
         $this->threads = isset($options['threads']);
         $this->threadLimit = (int)($options['thread-limit'] ?? self::DEFAULT_THREAD_LIMIT);
@@ -165,11 +169,11 @@ class ProcStat
         try {
             $maxFiles = min(4096, $this->maxPidScan * self::RLIMIT_FILES_MULTIPLIER);
             if (defined('RLIMIT_NOFILE')) {
-                setrlimit(RLIMIT_NOFILE, $maxFiles, $maxFiles);
+                setrlimit(RLIMIT_NOFILE, ['soft' => $maxFiles, 'hard' => $maxFiles]);
             }
             
             if (defined('RLIMIT_CPU')) {
-                setrlimit(RLIMIT_CPU, self::RLIMIT_CPU_TIME, self::RLIMIT_CPU_TIME);
+                setrlimit(RLIMIT_CPU, ['soft' => self::RLIMIT_CPU_TIME, 'hard' => self::RLIMIT_CPU_TIME]);
             }
         } catch (Throwable $e) {
             if ($this->verbose) {
@@ -181,7 +185,7 @@ class ProcStat
     private function validateProcFilesystem(): void
     {
         if (!file_exists('/proc') || !is_dir('/proc')) {
-            throw new RuntimeException('/proc filesystem not available or not mounted');
+            throw new RuntimeException('/proc filesystem not available or not mounted. Are you running Linux?');
         }
         
         if (!file_exists('/proc/self') && !file_exists('/proc/version')) {
@@ -252,7 +256,7 @@ class ProcStat
         
         $name = substr($content, 0, $lastParen);
         $name = trim($name, '()');
-        $data = substr($content, $lastParen + 2);
+        $data = ltrim(substr($content, $lastParen + 1));
         
         $fields = preg_split('/\s+/', $data);
         if (count($fields) < 22) {
@@ -280,7 +284,7 @@ class ProcStat
         
         $name = substr($content, 0, $lastParen);
         $name = trim($name, '()');
-        $data = substr($content, $lastParen + 2);
+        $data = ltrim(substr($content, $lastParen + 1));
         
         $fields = preg_split('/\s+/', $data);
         if (count($fields) < 14) {
@@ -357,6 +361,7 @@ Options:
       --kb              Show memory in kilobytes
       --mb              Show memory in megabytes (default)
       --json            Output in JSON format (one-shot mode only)
+      --debug           Enable debug mode with detailed logging
 
 Examples:
   {$scriptName} --limit=10 --sort=mem
@@ -367,8 +372,8 @@ Examples:
 
 Note: 
   - CPU usage can exceed 100% on multi-core systems
-  --watch and --json cannot be used together
-  In one-shot mode, CPU column shows lifetime seconds
+  - --watch and --json cannot be used together
+  - In one-shot mode, CPU column shows lifetime seconds
 
 HELP;
     }
@@ -490,9 +495,8 @@ HELP;
 
     private function handleSignal(int $signal): void
     {
-        static $handled = false;
-        if (!$handled) {
-            $handled = true;
+        if (!$this->signalHandled) {
+            $this->signalHandled = true;
             $this->shutdownRequested = true;
         }
     }
@@ -661,9 +665,6 @@ HELP;
                 $newCache[$pid] = $data;
                 $count++;
             }
-            if ($count >= self::MEMORY_CACHE_LIMIT) {
-                break;
-            }
         }
         
         $this->memoryCache = $newCache;
@@ -682,7 +683,7 @@ HELP;
                         $processes[] = $process;
                     }
                 } catch (Throwable $e) {
-                    if ($this->verbose) {
+                    if ($this->debug) {
                         fwrite(STDERR, "Debug: Error reading PID {$pid}: " . $e->getMessage() . "\n");
                     }
                 }
@@ -712,7 +713,7 @@ HELP;
             'pid' => $pid,
             'ppid' => $stat['ppid'],
             'cpu' => 0.0,
-            'cpu_time' => round($totalTime / $this->hertz, 1),
+            'cpu_time' => round($totalTime / max($this->hertz, self::FLOAT_EPSILON), 1),
             'memory' => round($memory, 1),
             'command' => $command,
             'state' => $stat['state'],
@@ -734,7 +735,7 @@ HELP;
                         $processes[] = $process;
                     }
                 } catch (Throwable $e) {
-                    if ($this->verbose) {
+                    if ($this->debug) {
                         fwrite(STDERR, "Debug: Error reading PID {$pid}: " . $e->getMessage() . "\n");
                     }
                 }
@@ -759,7 +760,8 @@ HELP;
             $timeDiff = 0.0;
         }
         
-        $cpuUsage = 100.0 * ($timeDiff / $this->hertz) / max($interval, self::FLOAT_EPSILON);
+        $hertz = max($this->hertz, self::FLOAT_EPSILON);
+        $cpuUsage = 100.0 * ($timeDiff / $hertz) / max($interval, self::FLOAT_EPSILON);
         
         return max($cpuUsage, 0.0);
     }
@@ -802,7 +804,7 @@ HELP;
             'pid' => $pid,
             'ppid' => $stat['ppid'],
             'cpu' => round($cpuUsage, 1),
-            'cpu_time' => round($totalTime / $this->hertz, 1),
+            'cpu_time' => round($totalTime / max($this->hertz, self::FLOAT_EPSILON), 1),
             'memory' => round($memory, 1),
             'command' => $command,
             'state' => $stat['state'],
@@ -833,7 +835,7 @@ HELP;
         
         foreach ($entries as $entry) {
             if ($count >= $threadLimit) {
-                if ($this->verbose) {
+                if ($this->debug) {
                     fwrite(STDERR, "Debug: Reached thread limit {$threadLimit} for PID {$pid}\n");
                 }
                 break;
@@ -855,7 +857,7 @@ HELP;
                     $count++;
                 }
             } catch (Throwable $e) {
-                if ($this->verbose) {
+                if ($this->debug) {
                     fwrite(STDERR, "Debug: Error reading thread {$tid} for PID {$pid}: " . $e->getMessage() . "\n");
                 }
             }
@@ -944,7 +946,7 @@ HELP;
             'pid' => $tid,
             'ppid' => $pid,
             'cpu' => round($cpuUsage, 1),
-            'cpu_time' => round($totalTime / $this->hertz, 1),
+            'cpu_time' => round($totalTime / max($this->hertz, self::FLOAT_EPSILON), 1),
             'memory' => 0.0,
             'command' => '  |- ' . $this->sanitizeOutput($stat['name']),
             'state' => $stat['state'],
@@ -965,7 +967,7 @@ HELP;
             'pid' => $tid,
             'ppid' => $pid,
             'cpu' => 0.0,
-            'cpu_time' => round($totalTime / $this->hertz, 1),
+            'cpu_time' => round($totalTime / max($this->hertz, self::FLOAT_EPSILON), 1),
             'memory' => 0.0,
             'command' => '  |- ' . $this->sanitizeOutput($stat['name']),
             'state' => $stat['state'],
@@ -1133,7 +1135,10 @@ HELP;
             default => 'cpu',
         };
         
-        $sortedProcesses = $processes;
+        $sortedProcesses = array_filter($processes, function($proc) {
+            return isset($proc['pid']) && isset($proc['cpu']);
+        });
+        
         usort($sortedProcesses, function($a, $b) use ($sortField) {
             if ($sortField === 'pid' || $sortField === 'command') {
                 return $a[$sortField] <=> $b[$sortField];
