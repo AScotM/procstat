@@ -18,13 +18,10 @@ class ProcStat
     private const DEFAULT_CMD_LENGTH = 80;
     private const VALID_SORTS = ['cpu', 'mem', 'pid', 'command', 'time'];
     private const FLOAT_EPSILON = 0.00001;
-    private const MAX_STATS_AGE = 5;
     private const MAX_THREADS_PER_PROCESS = 1000;
     private const BATCH_SIZE = 100;
     private const BATCH_DELAY_US = 1000;
     private const MAX_STATS_SIZE = 1000000;
-    private const RLIMIT_FILES_MULTIPLIER = 3;
-    private const RLIMIT_CPU_TIME = 30;
     private const MAX_MEMORY_CACHE_AGE = 2;
     private const MEMORY_CACHE_LIMIT = 5000;
 
@@ -62,7 +59,6 @@ class ProcStat
         $this->hertz = $this->detectHertz();
         $this->cpuCores = $this->detectCpuCores();
         $this->validateOptions();
-        $this->setupResourceLimits();
     }
 
     private function parseArguments(): void
@@ -99,6 +95,10 @@ class ProcStat
         $this->threads = isset($options['threads']);
         $this->threadLimit = (int)($options['thread-limit'] ?? self::DEFAULT_THREAD_LIMIT);
         $this->maxPidScan = (int)($options['max-scan'] ?? self::DEFAULT_MAX_PID_SCAN);
+        if (isset($options['kb']) && isset($options['mb'])) {
+            throw new RuntimeException('--kb and --mb cannot be used together.');
+        }
+
         $this->useMb = !isset($options['kb']);
         $this->json = isset($options['json']);
         
@@ -157,28 +157,6 @@ class ProcStat
             return max(1, $cores);
         } catch (Throwable $e) {
             return 1;
-        }
-    }
-
-    private function setupResourceLimits(): void
-    {
-        if (!function_exists('setrlimit')) {
-            return;
-        }
-
-        try {
-            $maxFiles = min(4096, $this->maxPidScan * self::RLIMIT_FILES_MULTIPLIER);
-            if (defined('RLIMIT_NOFILE')) {
-                setrlimit(RLIMIT_NOFILE, ['soft' => $maxFiles, 'hard' => $maxFiles]);
-            }
-            
-            if (defined('RLIMIT_CPU')) {
-                setrlimit(RLIMIT_CPU, ['soft' => self::RLIMIT_CPU_TIME, 'hard' => self::RLIMIT_CPU_TIME]);
-            }
-        } catch (Throwable $e) {
-            if ($this->verbose) {
-                fwrite(STDERR, "Warning: Failed to set resource limits: " . $e->getMessage() . "\n");
-            }
         }
     }
 
@@ -249,13 +227,13 @@ class ProcStat
     private function parseStatContent(string $content): ?array
     {
         $content = trim($content);
+        $firstParen = strpos($content, '(');
         $lastParen = strrpos($content, ')');
-        if ($lastParen === false) {
+        if ($firstParen === false || $lastParen === false || $lastParen <= $firstParen) {
             return null;
         }
         
-        $name = substr($content, 0, $lastParen);
-        $name = trim($name, '()');
+        $name = substr($content, $firstParen + 1, $lastParen - $firstParen - 1);
         $data = ltrim(substr($content, $lastParen + 1));
         
         $fields = preg_split('/\s+/', $data);
@@ -271,19 +249,20 @@ class ProcStat
             'stime' => (float)($fields[12] ?? 0),
             'cutime' => (float)($fields[13] ?? 0),
             'cstime' => (float)($fields[14] ?? 0),
+            'starttime' => (int)($fields[19] ?? 0),
         ];
     }
 
     private function parseThreadStatContent(string $content): ?array
     {
         $content = trim($content);
+        $firstParen = strpos($content, '(');
         $lastParen = strrpos($content, ')');
-        if ($lastParen === false) {
+        if ($firstParen === false || $lastParen === false || $lastParen <= $firstParen) {
             return null;
         }
         
-        $name = substr($content, 0, $lastParen);
-        $name = trim($name, '()');
+        $name = substr($content, $firstParen + 1, $lastParen - $firstParen - 1);
         $data = ltrim(substr($content, $lastParen + 1));
         
         $fields = preg_split('/\s+/', $data);
@@ -436,7 +415,7 @@ HELP;
                 continue;
             }
             
-            $totalTime = $stat['utime'] + $stat['stime'] + $stat['cutime'] + $stat['cstime'];
+            $totalTime = $stat['utime'] + $stat['stime'];
             
             $previousKey = "{$pid}_process";
             $this->previousStats[$previousKey] = [
@@ -449,7 +428,14 @@ HELP;
                 if (is_dir($taskDir)) {
                     $entries = @scandir($taskDir, SCANDIR_SORT_NONE);
                     if ($entries !== false) {
+                        $threadCount = 0;
+                        $threadLimit = min($this->threadLimit, self::MAX_THREADS_PER_PROCESS);
+
                         foreach ($entries as $entry) {
+                            if ($threadCount >= $threadLimit) {
+                                break;
+                            }
+
                             if ($entry === '.' || $entry === '..' || !ctype_digit($entry)) {
                                 continue;
                             }
@@ -469,6 +455,7 @@ HELP;
                                 'total_time' => $threadTotalTime,
                                 'timestamp' => microtime(true)
                             ];
+                            $threadCount++;
                         }
                     }
                 }
@@ -546,7 +533,7 @@ HELP;
             $uptime = $this->getUptime();
             $this->runOneShot($uptime);
         } catch (RuntimeException $e) {
-            echo "Error: " . $e->getMessage() . "\n";
+            fwrite(STDERR, "Error: " . $e->getMessage() . "\n");
             exit(1);
         }
     }
@@ -555,8 +542,7 @@ HELP;
     {
         $pids = $this->scanProcDirectory();
         if ($pids === null) {
-            echo "Error: Cannot access /proc directory. Check permissions.\n";
-            return;
+            throw new RuntimeException('Cannot access /proc directory. Check permissions.');
         }
         
         $pids = array_slice($pids, 0, $this->maxPidScan);
@@ -585,7 +571,7 @@ HELP;
         $this->render($processes, $uptime);
         
         if (!$this->json) {
-            echo "\nTotal entries displayed: " . count($processes) . "\n";
+            echo "\nTotal entries displayed: " . min($this->limit, count($processes)) . "\n";
             echo "Note: Showing lifetime CPU time (seconds), not current usage\n";
         }
     }
@@ -602,7 +588,7 @@ HELP;
         
         $currentScanTime = microtime(true);
         $actualInterval = $this->hasBaseline ? $currentScanTime - $this->lastScanTime : $this->interval;
-        $actualInterval = max(0.1, min(10.0, $actualInterval));
+        $actualInterval = max(self::FLOAT_EPSILON, $actualInterval);
         
         $this->lastScanTime = $currentScanTime;
         
@@ -636,6 +622,7 @@ HELP;
     {
         $now = microtime(true);
         $maxStats = min($this->maxPidScan * 2, self::MAX_STATS_SIZE);
+        $maxAge = max(5.0, $this->interval * 3.0);
         
         if (count($this->previousStats) > $maxStats) {
             uasort($this->previousStats, fn($a, $b) => $b['timestamp'] <=> $a['timestamp']);
@@ -643,7 +630,7 @@ HELP;
         }
         
         foreach ($this->previousStats as $key => $stat) {
-            if ($now - $stat['timestamp'] > self::MAX_STATS_AGE) {
+            if ($now - $stat['timestamp'] > $maxAge) {
                 unset($this->previousStats[$key]);
             }
         }
@@ -704,9 +691,9 @@ HELP;
             return null;
         }
         
-        $totalTime = $stat['utime'] + $stat['stime'] + $stat['cutime'] + $stat['cstime'];
+        $totalTime = $stat['utime'] + $stat['stime'];
         
-        $memory = $this->getMemoryUsage($pid);
+        $memory = $this->getMemoryUsage($pid, $stat['starttime']);
         $command = $this->getProcessCommand($pid, $stat['name']);
         
         return [
@@ -777,7 +764,7 @@ HELP;
             return null;
         }
         
-        $totalTime = $stat['utime'] + $stat['stime'] + $stat['cutime'] + $stat['cstime'];
+        $totalTime = $stat['utime'] + $stat['stime'];
         
         $previousKey = "{$pid}_process";
         $cpuUsage = 0.0;
@@ -797,7 +784,7 @@ HELP;
             ];
         }
         
-        $memory = $this->getMemoryUsage($pid);
+        $memory = $this->getMemoryUsage($pid, $stat['starttime']);
         $command = $this->getProcessCommand($pid, $stat['name']);
         
         return [
@@ -948,7 +935,7 @@ HELP;
             'cpu' => round($cpuUsage, 1),
             'cpu_time' => round($totalTime / max($this->hertz, self::FLOAT_EPSILON), 1),
             'memory' => 0.0,
-            'command' => '  |- ' . $this->sanitizeOutput($stat['name']),
+            'command' => '[thread] ' . $this->sanitizeOutput($stat['name']),
             'state' => $stat['state'],
             'type' => 'thread'
         ];
@@ -969,15 +956,15 @@ HELP;
             'cpu' => 0.0,
             'cpu_time' => round($totalTime / max($this->hertz, self::FLOAT_EPSILON), 1),
             'memory' => 0.0,
-            'command' => '  |- ' . $this->sanitizeOutput($stat['name']),
+            'command' => '[thread] ' . $this->sanitizeOutput($stat['name']),
             'state' => $stat['state'],
             'type' => 'thread'
         ];
     }
 
-    private function getMemoryUsage(int $pid): float
+    private function getMemoryUsage(int $pid, int $startTime): float
     {
-        $cacheKey = "mem_{$pid}";
+        $cacheKey = "mem_{$pid}_{$startTime}";
         
         if (isset($this->memoryCache[$cacheKey])) {
             $cacheAge = microtime(true) - $this->memoryCache[$cacheKey]['timestamp'];
@@ -1132,7 +1119,7 @@ HELP;
             'pid' => 'pid',
             'command' => 'command',
             'time' => 'cpu_time',
-            default => 'cpu',
+            default => $this->watch ? 'cpu' : 'cpu_time',
         };
         
         $sortedProcesses = array_filter($processes, function($proc) {
@@ -1154,6 +1141,7 @@ HELP;
             'timestamp' => time(),
             'uptime' => $uptime,
             'cpu_cores' => $this->cpuCores,
+            'memory_unit' => $this->useMb ? 'MB' : 'KB',
             'total_processes' => count($processes),
             'displayed_processes' => count($displayProcesses),
             'sort_by' => $this->sort,
@@ -1190,7 +1178,7 @@ HELP;
             'pid' => 'pid',
             'command' => 'command',
             'time' => 'cpu_time',
-            default => 'cpu',
+            default => $this->watch ? 'cpu' : 'cpu_time',
         };
         
         $ascending = in_array($sortField, ['pid', 'command'], true);
